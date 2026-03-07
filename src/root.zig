@@ -463,10 +463,6 @@ pub const FieldEvent = struct {
     descriptor: *const FieldDescriptor,
     old_value: i32,
     new_value: i32,
-
-    pub fn asBool(self: *const FieldEvent) bool {
-        return self.new_value == 1;
-    }
 };
 
 pub fn EventQueue(comptime T: type) type {
