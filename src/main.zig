@@ -19,12 +19,6 @@ pub fn main() !void {
 
     if (hidder.getXPPenDevice(devices_list) catch null) |xppen| {
         const report = try hidder.getDescriptors(allocator, &xppen);
-        for (report.items) |item| {
-            std.debug.print("{any}\n", .{item});
-            if (!item.isInput()) continue;
-            const input = hidder.InputItem.fromHidItem(&item);
-            if (input.constant) continue;
-        }
 
         var subs = [_]*const hidder.FieldDescriptor{ &report.field_descriptors[0], &report.field_descriptors[1], &report.field_descriptors[2], &report.field_descriptors[10] };
         var queue = hidder.EventQueue(hidder.FieldEvent).init(allocator);
