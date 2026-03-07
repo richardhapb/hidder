@@ -11,13 +11,13 @@ pub fn main() !void {
 
     if (hidder.getXPPenDevice(devices_list) catch null) |xppen| {
         const descriptors = try hidder.getDescriptors(allocator, &xppen);
-        for (descriptors) |desc| {
-            if (!desc.isInput()) continue;
-            const input = hidder.InputItem.fromHidItem(&desc);
+        for (descriptors.items) |item| {
+            std.debug.print("{any}\n", .{item});
+            if (!item.isInput()) continue;
+            const input = hidder.InputItem.fromHidItem(&item);
             if (input.constant) continue;
-            std.debug.print("{any}\n\n", .{input});
         }
 
-        try hidder.readInputReports(&xppen);
+        try hidder.readReports(&xppen, descriptors.field_descriptors);
     }
 }

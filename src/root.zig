@@ -105,6 +105,145 @@ const HidItemType = enum(u2) {
     reserved = 3,
 };
 
+const LocalState = struct {
+    usages: [256]u32 = undefined,
+    usage_count: u16 = 0,
+    usage_min: ?u32 = null,
+    usage_max: ?u32 = null,
+    designator_index: ?u16 = null,
+    designator_min: ?u16 = null,
+    designator_max: ?u16 = null,
+    string_index: ?u16 = null,
+    string_min: ?u16 = null,
+    string_max: ?u16 = null,
+
+    fn appendUsage(self: *LocalState, usage: u32) void {
+        if (self.usage_count < 256) {
+            self.usages[self.usage_count] = usage;
+            self.usage_count += 1;
+        }
+    }
+
+    fn reset(self: *LocalState) void {
+        self.usage_count = 0;
+        self.usage_min = null;
+        self.usage_max = null;
+        self.designator_index = null;
+        self.designator_min = null;
+        self.designator_max = null;
+        self.string_index = null;
+        self.string_min = null;
+        self.string_max = null;
+    }
+};
+
+const GlobalState = struct {
+    usage_page: u16 = 0,
+    logical_min: i32 = 0,
+    logical_max: i32 = 0,
+    physical_min: i32 = 0,
+    physical_max: i32 = 0,
+    unit_exponent: i8 = 0,
+    unit: u32 = 0,
+    report_size: u16 = 0,
+    report_count: u16 = 0,
+    report_id: ?u8 = null,
+};
+
+const DescriptorState = struct {
+    global: GlobalState = .{},
+    local: LocalState = .{},
+    global_stack: [16]GlobalState = undefined,
+    stack_depth: u8 = 0,
+    bit_offsets: std.AutoHashMap(u8, u16), // per report_id
+
+    fn init(allocator: std.mem.Allocator) DescriptorState {
+        return .{ .bit_offsets = std.AutoHashMap(u8, u16).init(allocator) };
+    }
+
+    fn deinit(self: *DescriptorState) void {
+        self.bit_offsets.deinit();
+    }
+
+    fn getBitOffset(self: *DescriptorState) u16 {
+        const id = self.global.report_id orelse 0;
+        return self.bit_offsets.get(id) orelse if (self.global.report_id != null) 8 else 0;
+    }
+
+    fn addBitOffset(self: *DescriptorState, bits: u16) !void {
+        const id = self.global.report_id orelse 0;
+        const current = self.getBitOffset();
+        try self.bit_offsets.put(id, current + bits);
+    }
+
+    fn push(self: *DescriptorState) !void {
+        if (self.stack_depth >= 16) return error.StackOverflow;
+        self.global_stack[self.stack_depth] = self.global;
+        self.stack_depth += 1;
+    }
+
+    fn pop(self: *DescriptorState) !void {
+        if (self.stack_depth == 0) return error.StackUnderflow;
+        self.stack_depth -= 1;
+        self.global = self.global_stack[self.stack_depth];
+    }
+};
+
+pub const FieldDescriptor = struct {
+    usage_page: u16,
+    usage: u16,
+    logical_min: i32,
+    logical_max: i32,
+    physical_min: i32,
+    physical_max: i32,
+    unit_exponent: i8,
+    unit: u32,
+    report_id: ?u8,
+    bit_offset: u16,
+    bit_size: u16,
+    flags: u32, // raw INPUT/OUTPUT/FEATURE flags
+
+    pub fn isConstant(self: *const FieldDescriptor) bool {
+        return (self.flags & (1 << 0)) != 0;
+    }
+
+    pub fn isVariable(self: *const FieldDescriptor) bool {
+        return (self.flags & (1 << 1)) != 0;
+    }
+
+    pub fn isRelative(self: *const FieldDescriptor) bool {
+        return (self.flags & (1 << 2)) != 0;
+    }
+
+    pub fn extractRaw(self: *const FieldDescriptor, buf: []const u8) u32 {
+        var result: u32 = 0;
+        var i: u16 = 0;
+        while (i < self.bit_size) : (i += 1) {
+            const bit_pos = self.bit_offset + i;
+            const byte_idx = bit_pos / 8;
+            if (byte_idx >= buf.len) break;
+            const bit_idx: u3 = @truncate(bit_pos % 8);
+            const bit = (buf[byte_idx] >> bit_idx) & 1;
+            result |= @as(u32, bit) << @truncate(i);
+        }
+        return result;
+    }
+
+    pub fn extractSigned(self: *const FieldDescriptor, buf: []const u8) i32 {
+        const raw = self.extractRaw(buf);
+        // Sign extend if logical_min is negative
+        if (self.logical_min < 0) {
+            const sign_bit = @as(u32, 1) << @as(u5, @intCast(self.bit_size - 1));
+            if ((raw & sign_bit) != 0) {
+                // Sign extend
+                const mask = @as(u32, 0xFFFFFFFF) << @as(u5, @intCast(self.bit_size));
+                return @bitCast(raw | mask);
+            }
+        }
+        return @intCast(raw);
+    }
+};
+
 const HidItem = struct {
     tag: u4,
     typ: HidItemType,
@@ -132,15 +271,15 @@ pub const InputItem = struct {
         const d = hid.data;
 
         return .{
-            .constant  = (d & (1 << 0)) == 1, // 0=Data,      1=Constant
-            .array     = (d & (1 << 1)) == 0, // 0=Array,     1=Variable
-            .relative  = (d & (1 << 2)) != 0, // 0=Absolute,  1=Relative
-            .wrap      = (d & (1 << 3)) != 0, // 0=No Wrap,   1=Wrap
-            .linear    = (d & (1 << 4)) == 0, // 0=Linear,    1=Non Linear
+            .constant = (d & (1 << 0)) != 0, // 0=Data,      1=Constant
+            .array = (d & (1 << 1)) == 0, // 0=Array,     1=Variable
+            .relative = (d & (1 << 2)) != 0, // 0=Absolute,  1=Relative
+            .wrap = (d & (1 << 3)) != 0, // 0=No Wrap,   1=Wrap
+            .linear = (d & (1 << 4)) == 0, // 0=Linear,    1=Non Linear
             .preferred = (d & (1 << 5)) == 0, // 0=Preferred, 1=No Preferred
-            .nullable  = (d & (1 << 6)) != 0, // 0=No Null,   1=Null
-            .volat     = (d & (1 << 7)) != 0, // 0=Non Vol,   1=Volatile
-            .buffered  = (d & (1 << 9)) != 0, // 0=Bit Field, 1=Buffered Bytes
+            .nullable = (d & (1 << 6)) != 0, // 0=No Null,   1=Null
+            .volat = (d & (1 << 7)) != 0, // 0=Non Vol,   1=Volatile
+            .buffered = (d & (1 << 9)) != 0, // 0=Bit Field, 1=Buffered Bytes
         };
     }
 };
@@ -185,7 +324,22 @@ pub fn parseNextItem(buf: []const u8, offset: *usize) !HidItem {
     return HidItem{ .tag = tag, .typ = typ, .data = data, .size = data_size };
 }
 
-pub fn getDescriptors(allocator: std.mem.Allocator, device: *const DeviceInfo) ![]HidItem {
+const ReportDescriptor = struct {
+    items: []HidItem,
+    field_descriptors: []FieldDescriptor,
+};
+
+fn signExtend(value: u32, size: u8) i32 {
+    if (size == 0 or size >= 32) return @bitCast(value);
+    const sign_bit = @as(u32, 1) << @as(u5, @intCast(size - 1));
+    if ((value & sign_bit) != 0) {
+        const mask = @as(u32, 0xFFFFFFFF) << @as(u5, @intCast(size));
+        return @bitCast(value | mask);
+    }
+    return @bitCast(value);
+}
+
+pub fn getDescriptors(allocator: std.mem.Allocator, device: *const DeviceInfo) !ReportDescriptor {
     var buf: [c.HID_API_MAX_REPORT_DESCRIPTOR_SIZE]u8 = undefined;
     const handle = c.hid_open_path(device.path) orelse return error.HidOpenFailed;
     defer c.hid_close(handle);
@@ -193,35 +347,145 @@ pub fn getDescriptors(allocator: std.mem.Allocator, device: *const DeviceInfo) !
     const n = c.hid_get_report_descriptor(handle, &buf, buf.len);
     if (n < 0) return error.ReportDescriptorError;
 
-    const descriptors = buf[0..@intCast(n)];
+    const descriptors_raw = buf[0..@intCast(n)];
     var items = try std.ArrayList(HidItem).initCapacity(allocator, 1);
+    var descriptors = try std.ArrayList(FieldDescriptor).initCapacity(allocator, 1);
     var offset: usize = 0;
 
-    while (offset < descriptors.len) {
-        const item = try parseNextItem(descriptors, &offset);
+    var state = DescriptorState.init(allocator);
+    defer state.deinit();
+
+    while (offset < descriptors_raw.len) {
+        const item = try parseNextItem(descriptors_raw, &offset);
+
+        switch (item.typ) {
+            .global => switch (item.tag) {
+                0b0000 => state.global.usage_page = @truncate(item.data),
+                0b0001 => state.global.logical_min = signExtend(item.data, item.size * 8),
+                0b0010 => state.global.logical_max = signExtend(item.data, item.size * 8),
+                0b0011 => state.global.physical_min = signExtend(item.data, item.size * 8),
+                0b0100 => state.global.physical_max = signExtend(item.data, item.size * 8),
+                0b0101 => state.global.unit_exponent = @truncate(@as(i32, @bitCast(item.data))),
+                0b0110 => state.global.unit = item.data,
+                0b0111 => state.global.report_size = @truncate(item.data),
+                0b1000 => state.global.report_id = @truncate(item.data),
+                0b1001 => state.global.report_count = @truncate(item.data),
+                0b1010 => try state.push(),
+                0b1011 => try state.pop(),
+                else => {},
+            },
+            .local => switch (item.tag) {
+                0b0000 => { // Usage
+                    const usage: u32 = if (item.size >= 4) item.data else (item.data | (@as(u32, state.global.usage_page) << 16));
+                    state.local.appendUsage(usage);
+                },
+                0b0001 => { // Usage Minimum
+                    state.local.usage_min = if (item.size >= 4) item.data else (item.data | (@as(u32, state.global.usage_page) << 16));
+                },
+                0b0010 => { // Usage Maximum
+                    state.local.usage_max = if (item.size >= 4) item.data else (item.data | (@as(u32, state.global.usage_page) << 16));
+                },
+                0b0011 => state.local.designator_index = @truncate(item.data),
+                0b0100 => state.local.designator_min = @truncate(item.data),
+                0b0101 => state.local.designator_max = @truncate(item.data),
+                0b0111 => state.local.string_index = @truncate(item.data),
+                0b1000 => state.local.string_min = @truncate(item.data),
+                0b1001 => state.local.string_max = @truncate(item.data),
+                else => {},
+            },
+            .main => {
+                // Input (0b1000), Output (0b1001), Feature (0b1011) all define data fields
+                if (item.tag == 0b1000 or item.tag == 0b1001 or item.tag == 0b1011) {
+                    const report_count = state.global.report_count;
+                    const report_size = state.global.report_size;
+
+                    // Build usage list from explicit usages or usage range
+                    var usage_list: [256]u32 = undefined;
+                    var usage_count: u16 = 0;
+
+                    if (state.local.usage_count > 0) {
+                        for (state.local.usages[0..state.local.usage_count]) |u| {
+                            if (usage_count < 256) {
+                                usage_list[usage_count] = u;
+                                usage_count += 1;
+                            }
+                        }
+                    } else if (state.local.usage_min != null and state.local.usage_max != null) {
+                        var u = state.local.usage_min.?;
+                        while (u <= state.local.usage_max.? and usage_count < 256) : (u += 1) {
+                            usage_list[usage_count] = u;
+                            usage_count += 1;
+                        }
+                    }
+
+                    // Create a field descriptor for each field in report_count
+                    var i: u16 = 0;
+                    while (i < report_count) : (i += 1) {
+                        // Use corresponding usage, or last usage, or 0
+                        const usage: u32 = if (i < usage_count)
+                            usage_list[i]
+                        else if (usage_count > 0)
+                            usage_list[usage_count - 1]
+                        else
+                            @as(u32, state.global.usage_page) << 16;
+
+                        try descriptors.append(allocator, .{
+                            .usage_page = @truncate(usage >> 16),
+                            .usage = @truncate(usage),
+                            .logical_min = state.global.logical_min,
+                            .logical_max = state.global.logical_max,
+                            .physical_min = state.global.physical_min,
+                            .physical_max = state.global.physical_max,
+                            .unit_exponent = state.global.unit_exponent,
+                            .unit = state.global.unit,
+                            .report_id = state.global.report_id,
+                            .bit_offset = state.getBitOffset(),
+                            .bit_size = report_size,
+                            .flags = item.data,
+                        });
+
+                        try state.addBitOffset(report_size);
+                    }
+                }
+                // Reset local state after any Main item
+                state.local.reset();
+            },
+            .reserved => {},
+        }
+
         try items.append(allocator, item);
     }
 
-    return items.toOwnedSlice(allocator);
+    return .{ .items = try items.toOwnedSlice(allocator), .field_descriptors = try descriptors.toOwnedSlice(allocator) };
 }
 
-pub fn readInputReports(device: *const DeviceInfo) !void {
+pub fn readReports(device: *const DeviceInfo, descriptors: []const FieldDescriptor) !void {
     var buf: [64]u8 = undefined;
 
-    std.debug.print("opening path: {s}\n", .{device.path});
     const handle = c.hid_open_path(device.path) orelse return error.HidOpenFailed;
     defer _ = c.hid_close(handle);
 
-    for (0..1000) |_| {
-        const n: usize = @intCast(c.hid_read(handle, &buf, buf.len));
+    while (true) {
+        const result = c.hid_read(handle, &buf, buf.len);
+        if (result < 0) return error.HidReadFailed;
+        const n: usize = @intCast(result);
+        if (n == 0) continue;
 
-        if (n < 0) return error.HidReadFailed;
+        // First byte is report ID if device uses report IDs
+        const report_id: ?u8 = if (descriptors.len > 0 and descriptors[0].report_id != null)
+            buf[0]
+        else
+            null;
 
-        std.debug.print("Read {} interrupts, {any}\n", .{ n, buf[0..@intCast(n)] });
+        for (descriptors) |desc| {
+            // Skip descriptors for other report IDs
+            if (desc.report_id != null and desc.report_id != report_id) continue;
+            // Skip constant fields (padding)
+            if (desc.isConstant()) continue;
 
-        for (0..n) |i| {
-            std.debug.print("Int: {any}\n", .{buf[i]});
+            const value = desc.extractSigned(buf[0..n]);
+            std.debug.print("page=0x{X:0>2} usage=0x{X:0>2}: {d}\n", .{ desc.usage_page, desc.usage, value });
         }
+        std.debug.print("---\n", .{});
     }
 }
-
