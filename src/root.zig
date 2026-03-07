@@ -459,33 +459,126 @@ pub fn getDescriptors(allocator: std.mem.Allocator, device: *const DeviceInfo) !
     return .{ .items = try items.toOwnedSlice(allocator), .field_descriptors = try descriptors.toOwnedSlice(allocator) };
 }
 
-pub fn readReports(device: *const DeviceInfo, descriptors: []const FieldDescriptor) !void {
-    var buf: [64]u8 = undefined;
+pub const FieldEvent = struct {
+    descriptor: *const FieldDescriptor,
+    old_value: i32,
+    new_value: i32,
 
-    const handle = c.hid_open_path(device.path) orelse return error.HidOpenFailed;
-    defer _ = c.hid_close(handle);
-
-    while (true) {
-        const result = c.hid_read(handle, &buf, buf.len);
-        if (result < 0) return error.HidReadFailed;
-        const n: usize = @intCast(result);
-        if (n == 0) continue;
-
-        // First byte is report ID if device uses report IDs
-        const report_id: ?u8 = if (descriptors.len > 0 and descriptors[0].report_id != null)
-            buf[0]
-        else
-            null;
-
-        for (descriptors) |desc| {
-            // Skip descriptors for other report IDs
-            if (desc.report_id != null and desc.report_id != report_id) continue;
-            // Skip constant fields (padding)
-            if (desc.isConstant()) continue;
-
-            const value = desc.extractSigned(buf[0..n]);
-            std.debug.print("page=0x{X:0>2} usage=0x{X:0>2}: {d}\n", .{ desc.usage_page, desc.usage, value });
-        }
-        std.debug.print("---\n", .{});
+    pub fn asBool(self: *const FieldEvent) bool {
+        return self.new_value == 1;
     }
+};
+
+pub fn EventQueue(comptime T: type) type {
+    return struct {
+        const Self = @This();
+        allocator: std.mem.Allocator,
+        buf: std.Deque(T),
+        mutex: std.atomic.Mutex = .unlocked,
+
+        pub fn init(allocator: std.mem.Allocator) Self {
+            return .{ .allocator = allocator, .buf = .empty };
+        }
+
+        pub fn deinit(self: *Self) void {
+            self.buf.deinit(self.allocator);
+        }
+
+        fn lock(self: *Self) void {
+            while (!self.mutex.tryLock()) {}
+        }
+
+        pub fn push(self: *Self, event: T) !void {
+            self.lock();
+            defer self.mutex.unlock();
+            try self.buf.pushBack(self.allocator, event);
+        }
+
+        pub fn pop(self: *Self) ?T {
+            self.lock();
+            defer self.mutex.unlock();
+            return self.buf.popFront();
+        }
+    };
 }
+
+pub const ReportsWatcher = struct {
+    device: *const DeviceInfo,
+    report: ReportDescriptor,
+    subs_map: std.AutoHashMap(*FieldDescriptor, i32),
+    subscriptions: []*const FieldDescriptor,
+    queue: *EventQueue(FieldEvent),
+    thread: ?std.Thread = null,
+
+    pub fn init(allocator: std.mem.Allocator, device: *const DeviceInfo, report: ReportDescriptor, subscriptions: []*const FieldDescriptor, queue: *EventQueue(FieldEvent)) ReportsWatcher {
+        return .{ .device = device, .report = report, .subs_map = std.AutoHashMap(*FieldDescriptor, i32).init(allocator), .subscriptions = subscriptions, .queue = queue };
+    }
+
+    pub fn deinit(self: *ReportsWatcher) void {
+        self.subs_map.deinit();
+    }
+
+    pub fn start(self: *ReportsWatcher) !void {
+        self.thread = try std.Thread.spawn(.{}, readReports, .{self});
+    }
+    pub fn stop(self: *ReportsWatcher) void {
+        // we'll need an atomic flag for clean shutdown - for now:
+        if (self.thread) |t| t.join();
+    }
+
+    pub fn readReports(self: *ReportsWatcher) !void {
+        var buf: [64]u8 = undefined;
+        const descriptors = self.report.field_descriptors;
+
+        const handle = c.hid_open_path(self.device.path) orelse return error.HidOpenFailed;
+        defer _ = c.hid_close(handle);
+
+        while (true) {
+            const result = c.hid_read(handle, &buf, buf.len);
+            if (result < 0) return error.HidReadFailed;
+            const n: usize = @intCast(result);
+            if (n == 0) continue;
+
+            // First byte is report ID if device uses report IDs
+            const report_id: ?u8 = if (descriptors.len > 0 and descriptors[0].report_id != null)
+                buf[0]
+            else
+                null;
+
+            for (descriptors, 0..) |desc, i| {
+                // Skip descriptors for other report IDs
+                if (desc.report_id != null and desc.report_id != report_id) continue;
+                // Skip constant fields (padding)
+                if (desc.isConstant()) continue;
+
+                const value = desc.extractSigned(buf[0..n]);
+                // std.debug.print("page=0x{X:0>2} usage=0x{X:0>2}: {d}\n", .{ desc.usage_page, desc.usage, value });
+
+                const prev_value = self.subs_map.get(@constCast(&descriptors[i]));
+                try self.subs_map.put(@constCast(&descriptors[i]), value);
+
+                const old = prev_value orelse continue;
+                if (old != value and self.isTracked(&descriptors[i])) self.notify(&descriptors[i], old, value);
+            }
+            // std.debug.print("---\n", .{});
+        }
+    }
+
+    fn isTracked(self: *const ReportsWatcher, desc: *const FieldDescriptor) bool {
+        for (self.subscriptions) |sub| {
+            if (sub == desc) return true;
+        }
+
+        return false;
+    }
+
+    fn notify(self: *ReportsWatcher, desc: *const FieldDescriptor, old: i32, new: i32) void {
+        self.queue.push(.{
+            .descriptor = desc,
+            .old_value = old,
+            .new_value = new,
+        }) catch {
+            std.log.err("Cannot notify event: {any}", .{desc});
+        };
+    }
+};
