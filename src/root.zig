@@ -471,9 +471,10 @@ pub fn EventQueue(comptime T: type) type {
         allocator: std.mem.Allocator,
         buf: std.Deque(T),
         mutex: std.atomic.Mutex = .unlocked,
+        io: std.Io,
 
-        pub fn init(allocator: std.mem.Allocator) Self {
-            return .{ .allocator = allocator, .buf = .empty };
+        pub fn init(allocator: std.mem.Allocator, io: std.Io) Self {
+            return .{ .allocator = allocator, .buf = .empty, .io = io };
         }
 
         pub fn deinit(self: *Self) void {
@@ -495,34 +496,48 @@ pub fn EventQueue(comptime T: type) type {
             defer self.mutex.unlock();
             return self.buf.popFront();
         }
+
+        pub fn popWait(self: *Self, timeout_ns: i96) ?T {
+            const deadline = std.Io.Timestamp.now(self.io, .awake).nanoseconds + timeout_ns;
+            while (std.Io.Timestamp.now(self.io, .awake).nanoseconds < deadline) {
+                if (self.pop()) |event| return event;
+                var timespec: std.posix.timespec = .{ .sec = 1, .nsec = 0 };
+                _ = std.posix.system.nanosleep(&timespec, &timespec);
+            }
+
+            return null;
+        }
     };
 }
 
 pub const ReportsWatcher = struct {
+    const Self = @This();
+
     device: *const DeviceInfo,
     report: ReportDescriptor,
     subs_map: std.AutoHashMap(*FieldDescriptor, i32),
     subscriptions: []*const FieldDescriptor,
-    queue: *EventQueue(FieldEvent),
+    queue: EventQueue(FieldEvent),
     thread: ?std.Thread = null,
 
-    pub fn init(allocator: std.mem.Allocator, device: *const DeviceInfo, report: ReportDescriptor, subscriptions: []*const FieldDescriptor, queue: *EventQueue(FieldEvent)) ReportsWatcher {
-        return .{ .device = device, .report = report, .subs_map = std.AutoHashMap(*FieldDescriptor, i32).init(allocator), .subscriptions = subscriptions, .queue = queue };
+    pub fn init(allocator: std.mem.Allocator, io: std.Io, device: *const DeviceInfo, report: ReportDescriptor, subscriptions: []*const FieldDescriptor) Self {
+        return .{ .device = device, .report = report, .subs_map = std.AutoHashMap(*FieldDescriptor, i32).init(allocator), .subscriptions = subscriptions, .queue = EventQueue(FieldEvent).init(allocator, io) };
     }
 
-    pub fn deinit(self: *ReportsWatcher) void {
+    pub fn deinit(self: *Self) void {
         self.subs_map.deinit();
+        self.queue.deinit();
     }
 
-    pub fn start(self: *ReportsWatcher) !void {
+    pub fn start(self: *Self) !void {
         self.thread = try std.Thread.spawn(.{}, readReports, .{self});
     }
-    pub fn stop(self: *ReportsWatcher) void {
+    pub fn stop(self: *Self) void {
         // we'll need an atomic flag for clean shutdown - for now:
         if (self.thread) |t| t.join();
     }
 
-    pub fn readReports(self: *ReportsWatcher) !void {
+    pub fn readReports(self: *Self) !void {
         var buf: [64]u8 = undefined;
         const descriptors = self.report.field_descriptors;
 
@@ -560,7 +575,7 @@ pub const ReportsWatcher = struct {
         }
     }
 
-    fn isTracked(self: *const ReportsWatcher, desc: *const FieldDescriptor) bool {
+    fn isTracked(self: *const Self, desc: *const FieldDescriptor) bool {
         for (self.subscriptions) |sub| {
             if (sub == desc) return true;
         }
@@ -568,7 +583,7 @@ pub const ReportsWatcher = struct {
         return false;
     }
 
-    fn notify(self: *ReportsWatcher, desc: *const FieldDescriptor, old: i32, new: i32) void {
+    fn notify(self: *Self, desc: *const FieldDescriptor, old: i32, new: i32) void {
         self.queue.push(.{
             .descriptor = desc,
             .old_value = old,

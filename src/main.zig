@@ -21,9 +21,9 @@ pub fn main() !void {
         const report = try hidder.getDescriptors(allocator, &xppen);
 
         var subs = [_]*const hidder.FieldDescriptor{ &report.field_descriptors[0], &report.field_descriptors[1], &report.field_descriptors[2], &report.field_descriptors[10] };
-        var queue = hidder.EventQueue(hidder.FieldEvent).init(allocator);
-        defer queue.deinit();
-        var watcher = hidder.ReportsWatcher.init(allocator, &xppen, report, &subs, &queue);
+        var threaded: std.Io.Threaded = .init(allocator, .{});
+        defer threaded.deinit();
+        var watcher = hidder.ReportsWatcher.init(allocator, threaded.io(), &xppen, report, &subs);
         defer watcher.deinit();
 
         try watcher.start();
@@ -36,7 +36,7 @@ pub fn main() !void {
         try events_map.put(&report.field_descriptors[10], .pressure);
 
         while (true) {
-            while (watcher.queue.pop()) |event| {
+            while (watcher.queue.popWait(16_000_000)) |event| {
                 if (event.new_value == 0) continue;
                 const event_type = events_map.get(event.descriptor) orelse continue;
                 switch (event_type) {
