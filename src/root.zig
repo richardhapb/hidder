@@ -470,42 +470,55 @@ pub fn EventQueue(comptime T: type) type {
         const Self = @This();
         allocator: std.mem.Allocator,
         buf: std.Deque(T),
-        mutex: std.atomic.Mutex = .unlocked,
-        io: std.Io,
+        mutex: std.Io.Mutex,
+        epoch: std.atomic.Value(u32),
+        threaded: std.Io.Threaded,
 
-        pub fn init(allocator: std.mem.Allocator, io: std.Io) Self {
-            return .{ .allocator = allocator, .buf = .empty, .io = io };
+        pub fn init(allocator: std.mem.Allocator) Self {
+            return .{ .allocator = allocator, .buf = .empty, .mutex = .init, .epoch = .init(0), .threaded = .init(allocator, .{}) };
         }
 
         pub fn deinit(self: *Self) void {
             self.buf.deinit(self.allocator);
         }
 
-        fn lock(self: *Self) void {
-            while (!self.mutex.tryLock()) {}
+        fn io(self: *Self) std.Io {
+            return self.threaded.io();
         }
 
         pub fn push(self: *Self, event: T) !void {
-            self.lock();
-            defer self.mutex.unlock();
+            self.mutex.lockUncancelable(self.io());
+            defer self.mutex.unlock(self.io());
             try self.buf.pushBack(self.allocator, event);
+            _ = self.epoch.fetchAdd(1, .release);
+            self.io().futexWake(u32, &self.epoch.raw, 1);
         }
 
         pub fn pop(self: *Self) ?T {
-            self.lock();
-            defer self.mutex.unlock();
+            self.mutex.lockUncancelable(self.io());
+            defer self.mutex.unlock(self.io());
             return self.buf.popFront();
         }
 
         pub fn popWait(self: *Self, timeout_ns: i96) ?T {
-            const deadline = std.Io.Timestamp.now(self.io, .awake).nanoseconds + timeout_ns;
-            while (std.Io.Timestamp.now(self.io, .awake).nanoseconds < deadline) {
-                if (self.pop()) |event| return event;
-                var timespec: std.posix.timespec = .{ .sec = 1, .nsec = 0 };
-                _ = std.posix.system.nanosleep(&timespec, &timespec);
-            }
+            const timeout: std.Io.Timeout = .{ .duration = .{ .raw = std.Io.Duration.fromNanoseconds(timeout_ns), .clock = .awake } };
 
-            return null;
+            // First check without waiting
+            self.mutex.lockUncancelable(self.io());
+            if (self.buf.popFront()) |item| {
+                self.mutex.unlock(self.io());
+                return item;
+            }
+            const epoch = self.epoch.load(.acquire);
+            self.mutex.unlock(self.io());
+
+            // Wait for push to signal (or timeout - returns void either way)
+            self.io().futexWaitTimeout(u32, &self.epoch.raw, epoch, timeout) catch {};
+
+            // Check again after wait
+            self.mutex.lockUncancelable(self.io());
+            defer self.mutex.unlock(self.io());
+            return self.buf.popFront();
         }
     };
 }
@@ -520,8 +533,8 @@ pub const ReportsWatcher = struct {
     queue: EventQueue(FieldEvent),
     thread: ?std.Thread = null,
 
-    pub fn init(allocator: std.mem.Allocator, io: std.Io, device: *const DeviceInfo, report: ReportDescriptor, subscriptions: []*const FieldDescriptor) Self {
-        return .{ .device = device, .report = report, .subs_map = std.AutoHashMap(*FieldDescriptor, i32).init(allocator), .subscriptions = subscriptions, .queue = EventQueue(FieldEvent).init(allocator, io) };
+    pub fn init(allocator: std.mem.Allocator, device: *const DeviceInfo, report: ReportDescriptor, subscriptions: []*const FieldDescriptor) Self {
+        return .{ .device = device, .report = report, .subs_map = std.AutoHashMap(*FieldDescriptor, i32).init(allocator), .subscriptions = subscriptions, .queue = EventQueue(FieldEvent).init(allocator) };
     }
 
     pub fn deinit(self: *Self) void {

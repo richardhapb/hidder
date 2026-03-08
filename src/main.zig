@@ -21,9 +21,7 @@ pub fn main() !void {
         const report = try hidder.getDescriptors(allocator, &xppen);
 
         var subs = [_]*const hidder.FieldDescriptor{ &report.field_descriptors[0], &report.field_descriptors[1], &report.field_descriptors[2], &report.field_descriptors[10] };
-        var threaded: std.Io.Threaded = .init(allocator, .{});
-        defer threaded.deinit();
-        var watcher = hidder.ReportsWatcher.init(allocator, threaded.io(), &xppen, report, &subs);
+        var watcher = hidder.ReportsWatcher.init(allocator, &xppen, report, &subs);
         defer watcher.deinit();
 
         try watcher.start();
