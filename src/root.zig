@@ -2,8 +2,8 @@
 const std = @import("std");
 const c = @import("c");
 
-const XP_PEN_VENDOR_ID: u16 = 0x28bd;
-const XP_PEN_PRODUCT_ID: u16 = 0x0913;
+pub const XP_PEN_VENDOR_ID: u16 = 0x28bd;
+pub const XP_PEN_PRODUCT_ID: u16 = 0x0913;
 const STYLUS_INTERFACE: u8 = 1;
 
 pub const DeviceInfo = struct { vendor_id: u16, product_id: u16, path: [:0]const u8, manufacturer: ?[:0]const u8, product: ?[:0]const u8, interface: i32 };
@@ -331,7 +331,6 @@ pub const ReportDescriptor = struct {
     pub fn deinit(self: *ReportDescriptor, alloc: std.mem.Allocator) void {
         alloc.free(self.items);
         alloc.free(self.field_descriptors);
-
     }
 };
 
@@ -532,15 +531,19 @@ pub fn EventQueue(comptime T: type) type {
 pub const ReportsWatcher = struct {
     const Self = @This();
 
+    /// How long `readReports` blocks in a single read; upper bound for `stop` latency.
+    const READ_TIMEOUT_MS = 100;
+
     device: *const DeviceInfo,
     report: ReportDescriptor,
     subs_map: std.AutoHashMap(*FieldDescriptor, i32),
     subscriptions: []*const FieldDescriptor,
     queue: EventQueue(FieldEvent),
+    running: std.atomic.Value(bool),
     thread: ?std.Thread = null,
 
     pub fn init(allocator: std.mem.Allocator, device: *const DeviceInfo, report: ReportDescriptor, subscriptions: []*const FieldDescriptor) Self {
-        return .{ .device = device, .report = report, .subs_map = std.AutoHashMap(*FieldDescriptor, i32).init(allocator), .subscriptions = subscriptions, .queue = EventQueue(FieldEvent).init(allocator) };
+        return .{ .device = device, .report = report, .subs_map = std.AutoHashMap(*FieldDescriptor, i32).init(allocator), .subscriptions = subscriptions, .queue = EventQueue(FieldEvent).init(allocator), .running = .init(true) };
     }
 
     pub fn deinit(self: *Self) void {
@@ -549,11 +552,14 @@ pub const ReportsWatcher = struct {
     }
 
     pub fn start(self: *Self) !void {
+        self.running.store(true, .release);
         self.thread = try std.Thread.spawn(.{}, readReports, .{self});
     }
+
     pub fn stop(self: *Self) void {
-        // we'll need an atomic flag for clean shutdown - for now:
+        self.running.store(false, .release);
         if (self.thread) |t| t.join();
+        self.thread = null;
     }
 
     pub fn readReports(self: *Self) !void {
@@ -563,8 +569,10 @@ pub const ReportsWatcher = struct {
         const handle = c.hid_open_path(self.device.path) orelse return error.HidOpenFailed;
         defer _ = c.hid_close(handle);
 
-        while (true) {
-            const result = c.hid_read(handle, &buf, buf.len);
+        while (self.running.load(.acquire)) {
+            const result = c.hid_read_timeout(handle, &buf, buf.len, READ_TIMEOUT_MS);
+            // Read errors mean the device is gone (unplugged); exit and let the
+            // owner detect it through a DeviceMonitor.
             if (result < 0) return error.HidReadFailed;
             const n: usize = @intCast(result);
             if (n == 0) continue;
@@ -610,5 +618,80 @@ pub const ReportsWatcher = struct {
         }) catch {
             std.log.err("Cannot notify event: {any}", .{desc});
         };
+    }
+};
+
+pub fn isDevicePresent(vendor_id: u16, product_id: u16) bool {
+    const devices = c.hid_enumerate(vendor_id, product_id) orelse return false;
+    c.hid_free_enumeration(devices);
+    return true;
+}
+
+pub const HotplugEvent = enum { connected, disconnected };
+
+/// Polls `hid_enumerate` on a background thread and pushes a `HotplugEvent`
+/// whenever the device with the given vendor/product id appears or disappears.
+/// hidapi (as of 0.15) has no hotplug callbacks, so polling is the portable option.
+pub const DeviceMonitor = struct {
+    const Self = @This();
+
+    const POLL_INTERVAL_NS = std.time.ns_per_s;
+
+    vendor_id: u16,
+    product_id: u16,
+    present: bool,
+    queue: EventQueue(HotplugEvent),
+    // u32 rather than bool so the watch thread can futex-wait on it and wake
+    // immediately when `stop` is called
+    running: std.atomic.Value(u32),
+    threaded: std.Io.Threaded,
+    thread: ?std.Thread = null,
+
+    /// `initially_present` seeds the state so no event fires for a device
+    /// that was already handled before the monitor started.
+    pub fn init(allocator: std.mem.Allocator, vendor_id: u16, product_id: u16, initially_present: bool) Self {
+        return .{
+            .vendor_id = vendor_id,
+            .product_id = product_id,
+            .present = initially_present,
+            .queue = EventQueue(HotplugEvent).init(allocator),
+            .running = .init(0),
+            .threaded = .init(allocator, .{}),
+        };
+    }
+
+    pub fn deinit(self: *Self) void {
+        self.queue.deinit();
+    }
+
+    /// The monitor must not be moved after calling this.
+    pub fn start(self: *Self) !void {
+        self.running.store(1, .release);
+        self.thread = try std.Thread.spawn(.{}, watch, .{self});
+    }
+
+    pub fn stop(self: *Self) void {
+        self.running.store(0, .release);
+        self.threaded.io().futexWake(u32, &self.running.raw, 1);
+        if (self.thread) |t| t.join();
+        self.thread = null;
+    }
+
+    fn watch(self: *Self) void {
+        const io = self.threaded.io();
+        const timeout: std.Io.Timeout = .{ .duration = .{ .raw = std.Io.Duration.fromNanoseconds(POLL_INTERVAL_NS), .clock = .awake } };
+
+        while (self.running.load(.acquire) == 1) {
+            const found = isDevicePresent(self.vendor_id, self.product_id);
+            if (found != self.present) {
+                self.present = found;
+                self.queue.push(if (found) .connected else .disconnected) catch |e| {
+                    std.log.err("Cannot notify hotplug event: {}", .{e});
+                };
+            }
+
+            // Sleeps POLL_INTERVAL_NS, but returns early if `stop` flips `running`
+            io.futexWaitTimeout(u32, &self.running.raw, 1, timeout) catch {};
+        }
     }
 };

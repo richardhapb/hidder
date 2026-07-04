@@ -12,7 +12,7 @@ const Events = enum {
 const MAX_PRESSURE: u16 = 8191;
 
 pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     const allocator = gpa.allocator();
 
     const devices_list = try hidder.discoverDevices(allocator);
