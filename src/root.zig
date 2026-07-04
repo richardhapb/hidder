@@ -324,7 +324,7 @@ pub fn parseNextItem(buf: []const u8, offset: *usize) !HidItem {
     return HidItem{ .tag = tag, .typ = typ, .data = data, .size = data_size };
 }
 
-const ReportDescriptor = struct {
+pub const ReportDescriptor = struct {
     items: []HidItem,
     field_descriptors: []FieldDescriptor,
 };
