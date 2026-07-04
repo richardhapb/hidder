@@ -327,6 +327,12 @@ pub fn parseNextItem(buf: []const u8, offset: *usize) !HidItem {
 pub const ReportDescriptor = struct {
     items: []HidItem,
     field_descriptors: []FieldDescriptor,
+
+    pub fn deinit(self: *ReportDescriptor, alloc: std.mem.Allocator) void {
+        alloc.free(self.items);
+        alloc.free(self.field_descriptors);
+
+    }
 };
 
 fn signExtend(value: u32, size: u8) i32 {
